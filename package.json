@@ -1,0 +1,38 @@
+{
+  "name": "clif-cli",
+  "version": "0.1.0",
+  "description": "Clif — the Claude Code context optimizer. A terminal-native, persistent PTY wrapper that monitors semantic drift and autonomously compacts or clears your Claude Code session.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "clif": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "context",
+    "pty",
+    "cli",
+    "token-optimization"
+  ],
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
