@@ -4,8 +4,10 @@ A phone web app for mapping your garden. Walk round with your phone, stand by ea
 
 ## What it does
 
-- **Map**: satellite map of your garden with a pin (showing a photo) for every plant. **Start walk** records the route you walk.
-- **Accurate positions**: while you add a plant it takes several GPS readings and averages the best ones. Phone GPS is usually good to 3–5 m in the open. If a pin lands in the wrong place, use **Drag pin** or **Re-record here** on the plant's page.
+- **Garden plan**: a to-scale plan on squared paper (1 m grid) that you build by walking. Tap **Trace**, pick what you're mapping (bed, lawn, patio, path, hedge, fence, shed, pond…), then walk round its edge, or tap its corners on the map. Each plant is drawn as a circle the size it will grow to. Tap any shape to rename it, see its area, list the plants in it, or drag its corners into place. **Satellite** and **Street** views are still there as alternatives.
+- **Steadier tracking**: while you walk, the app combines GPS with your phone's step counter and compass, so shapes come out smoother than GPS alone. When you finish a shape back where you started, any leftover gap is treated as drift and spread out along the walk.
+- **Care plans use the plan**: Claude is told which bed a plant is in and what's nearby (wall, hedge, shed, pond), so advice can account for shade, shelter and dry spots under hedges.
+- **Accurate positions**: while you add a plant it takes several GPS readings and averages the best ones (or uses the walk tracker if a walk is running). Phone GPS is usually good to 3–5 m in the open. If a pin lands in the wrong place, use **Drag pin** or **Re-record here** on the plant's page.
 - **Identification**: name, scientific name, confidence and other possible matches. It also checks the plant's health from the photos.
 - **Care plan**: light, watering, soil, feeding, pruning, pests, winter care, hardiness, toxicity to pets and children, plus a 12-month planner. Timings are based on your hemisphere and the notes you give about your garden.
 - **Jobs**: every plant's tasks for the month in one checklist.
@@ -23,6 +25,14 @@ The app is static files with no build step, but phones only allow GPS and camera
 
 To run it locally: `cd garden && python3 -m http.server 8000`, then open http://localhost:8000. Browsers treat `localhost` as secure, so GPS works on a laptop too.
 
+## Tips for mapping by walking
+
+- **Set your step length** in Settings: walk 10 normal steps, measure the distance and divide by 10. Step length is the biggest source of error in a shape's size.
+- Hold the phone flat in front of you, pointing the way you're walking, and walk at a steady pace.
+- For areas, finish back where you started so the drift correction can work.
+- Expect shapes to be within roughly 10–25% of their true area. In simulated walks round 6×4 m and 12×8 m beds, most came out within that range. Straight-edged things like patios and sheds are often quicker to tap in by hand, then adjust.
+- On iPhone, allow "Motion & Orientation Access" when asked. Without it, the app falls back to GPS only, which is less steady and tends to shrink small shapes.
+
 ## Cost
 
 Each identification is one Claude API call with up to 5 photos. With Claude Opus 5.5 that costs roughly $0.05–0.10 per plant. Sonnet 5.5 (pick it in Settings) costs about half that.
@@ -32,7 +42,10 @@ Each identification is one Claude API call with up to 5 photos. With Claude Opus
 | File | Purpose |
 | --- | --- |
 | `index.html`, `styles.css` | Layout and styling |
-| `app.js` | Map, GPS sampling, walk tracking, add-plant flow, plant pages, jobs, backup |
+| `app.js` | Map and plan views, tracing, add-plant flow, plant pages, jobs, backup |
+| `tracker.js` | Combines GPS, step counter and compass (Kalman filter) |
+| `geo.js` | Area, length, simplifying traced lines, loop closure, point-in-area |
+| `plan.js` | Plan feature types, colours and the metre grid |
 | `ai.js` | Claude call: photos in, structured JSON (ID + care plan) out |
 | `db.js` | IndexedDB storage for plants, photos and settings |
 | `sw.js`, `manifest.webmanifest` | Offline support and installing to the home screen |
