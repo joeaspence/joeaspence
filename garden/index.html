@@ -31,18 +31,26 @@
       <div id="map-fallback" class="map-fallback" hidden>
         <p>The map needs a connection to load. Your plants are still saved. Open the <strong>Plants</strong> tab to see them.</p>
       </div>
+      <div class="seg" role="group" aria-label="Map style">
+        <button data-mode="plan" aria-pressed="false">Plan</button>
+        <button data-mode="satellite" aria-pressed="true">Satellite</button>
+        <button data-mode="street" aria-pressed="false">Street</button>
+      </div>
       <div class="map-controls">
         <button id="btn-locate" class="round" title="Centre on me" aria-label="Centre on me">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /><circle cx="12" cy="12" r="7.5" fill="none"/></svg>
         </button>
-        <button id="btn-layer" class="round" title="Switch map style" aria-label="Switch map style">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 8l10 5 10-5-10-5Z" fill="none"/><path d="m2 13 10 5 10-5M2 17.5 12 22l10-4.5" fill="none"/></svg>
-        </button>
       </div>
       <div class="map-actions">
-        <button id="btn-walk" class="pill" aria-pressed="false">
-          <span class="dot"></span><span class="label">Start walk</span>
-        </button>
+        <div class="pill-group">
+          <button id="btn-walk" class="pill" aria-pressed="false">
+            <span class="dot"></span><span class="label">Start walk</span>
+          </button>
+          <button id="btn-trace" class="pill">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18 9 6l6 9 5-7" fill="none"/><circle cx="4" cy="18" r="1.6"/><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="15" r="1.6"/><circle cx="20" cy="8" r="1.6"/></svg>
+            Trace
+          </button>
+        </div>
         <button id="btn-add" class="fab">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           Add plant here
@@ -102,6 +110,12 @@
             <textarea id="set-climate" rows="3" placeholder="e.g. South-facing, clay soil, coastal and windy, frost most winters"></textarea>
             <small>Helps Claude tailor care plans. Your approximate location (to about 10 km) is also sent.</small>
           </label>
+          <label class="field">
+            <span>Your step length (metres)</span>
+            <input id="set-step" type="number" inputmode="decimal" step="0.05" min="0.3" max="1.5">
+            <small>Used when tracing by walking. To measure it, walk 10 normal steps and divide the distance by 10. Most adults are 0.6–0.8 m.</small>
+          </label>
+          <label class="check"><input id="set-motion" type="checkbox"> Use step counter and compass to steady GPS</label>
           <button class="primary" type="submit">Save settings</button>
         </form>
 

@@ -1,5 +1,8 @@
 import { plants as plantStore, photos as photoStore, meta, uid, clearAll } from "./db.js";
 import { identifyPlant, resizeImage, blobToBase64, DEFAULT_MODEL } from "./ai.js";
+import { Tracker } from "./tracker.js";
+import { simplify, closeLoop, areaM2, lengthM, pointInPolygon, formatArea, formatLength } from "./geo.js";
+import { FEATURE_TYPES, featureStyle, createGridLayer } from "./plan.js";
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -10,13 +13,19 @@ const MON = MONTHS.map((m) => m.slice(0, 3));
 const state = {
   plants: [],
   thumbs: new Map(), // plantId -> object URL of first photo
-  settings: { apiKey: "", model: DEFAULT_MODEL, climate: "" },
+  settings: { apiKey: "", model: DEFAULT_MODEL, climate: "", stepLength: 0.7, useMotion: true },
   map: null,
   markers: new Map(),
-  layers: null,
-  layerIdx: 0,
+  canopies: new Map(), // plantId -> circle showing the plant's spread
+  layers: null, // { satellite, street, grid }
+  mode: "satellite", // "plan" | "satellite" | "street"
+  features: [], // traced beds, lawns, paths… [{ id, type, name, closed, points: [{lat,lng}] }]
+  featureLayers: new Map(),
+  tracker: null,
+  trace: null, // feature being traced right now
+  editing: null, // feature whose corners are being dragged
   me: null, // { marker, circle }
-  walk: { active: false, watchId: null, path: [], line: null, wakeLock: null },
+  walk: { active: false, path: [], line: null, wakeLock: null, unsub: null },
   jobsMonth: new Date().getMonth() + 1,
   jobsDone: {},
   moving: null,
@@ -44,11 +53,11 @@ function displayName(p) {
   return p.nickname || p.ai?.common_name || "Unidentified plant";
 }
 
-function gpsChip(acc) {
+function gpsChip(acc, steps) {
   const chip = $("#gps-chip");
   if (acc == null) { chip.hidden = true; return; }
   chip.hidden = false;
-  chip.textContent = `GPS ±${Math.round(acc)} m`;
+  chip.textContent = `±${acc < 10 ? acc.toFixed(1) : Math.round(acc)} m` + (steps ? ` · ${steps} steps` : " GPS");
   chip.className = "chip " + (acc <= 6 ? "good" : "poor");
 }
 
@@ -96,12 +105,31 @@ function sampleFix({ onProgress, maxMs = 15000, goodAcc = 5, goodCount = 4 } = {
   return { promise, stop: finish };
 }
 
+/**
+ * Best position for "here". During a walk the fused tracker is already running, so watch it for a
+ * few seconds while you stand still (GPS keeps averaging in); otherwise take fresh GPS samples.
+ */
+function getFix({ onProgress, maxMs = 6000, goodAcc = 2.5 } = {}) {
+  const t = state.tracker;
+  if (!t?.active || !t.position) return sampleFix({ onProgress });
+  let unsub, timer, done;
+  const promise = new Promise((resolve) => {
+    done = () => { unsub?.(); clearTimeout(timer); resolve({ ...t.position, fromWalk: true }); };
+    const tick = (p) => { onProgress?.({ ...p, fromWalk: true }, { accuracy: t.gpsAccuracy ?? p.accuracy }); if (p.accuracy <= goodAcc) done(); };
+    unsub = t.subscribe(tick);
+    tick(t.position);
+    timer = setTimeout(done, maxMs);
+  });
+  return { promise, stop: () => done?.() };
+}
+
 /* ---------------- Data ---------------- */
 
 async function loadAll() {
   state.settings = { ...state.settings, ...(await meta.get("settings", {})) };
   state.jobsDone = await meta.get("jobsDone", {});
   state.walk.path = await meta.get("walkPath", []);
+  state.features = await meta.get("features", []);
   state.plants = await plantStore.all();
   state.plants.sort((a, b) => displayName(a).localeCompare(displayName(b)));
   for (const p of state.plants) await refreshThumb(p.id);
@@ -138,30 +166,43 @@ function initMap() {
     $("#map-fallback").hidden = false;
     return;
   }
-  const map = L.map("map", { zoomControl: false, maxZoom: 22, attributionControl: true });
+  const map = L.map("map", { zoomControl: false, maxZoom: 24, attributionControl: true });
   state.map = map;
-  state.layers = [
-    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
-      maxZoom: 22, maxNativeZoom: 19, attribution: "Imagery © Esri, Maxar, Earthstar Geographics",
+  const css = getComputedStyle(document.documentElement);
+  const anchor = state.plants.find((p) => p.lat != null) || state.features[0]?.points[0] || state.walk.path[0];
+  state.layers = {
+    satellite: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 24, maxNativeZoom: 19, attribution: "Imagery © Esri, Maxar, Earthstar Geographics",
     }),
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 22, maxNativeZoom: 19, attribution: "© OpenStreetMap contributors",
+    street: L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 24, maxNativeZoom: 19, attribution: "© OpenStreetMap contributors",
     }),
-  ];
-  state.layers[0].addTo(map);
+    grid: createGridLayer(L, {
+      minor: css.getPropertyValue("--grid-minor").trim(),
+      major: css.getPropertyValue("--grid-major").trim(),
+      lat0: anchor?.lat ?? 52,
+    }),
+  };
+  L.control.scale({ metric: true, imperial: false, position: "topleft", maxWidth: 120 }).addTo(map);
 
   state.walk.line = L.polyline(state.walk.path.map((p) => [p.lat, p.lng]), {
-    color: getComputedStyle(document.documentElement).getPropertyValue("--pollen").trim() || "#e0a92b",
-    weight: 4, opacity: 0.9, dashArray: "2 8", lineCap: "round",
+    color: css.getPropertyValue("--pollen").trim() || "#e0a92b",
+    weight: 3, opacity: 0.85, dashArray: "2 7", lineCap: "round", interactive: false,
   }).addTo(map);
 
   map.on("zoomend", () => map.getContainer().classList.toggle("show-labels", map.getZoom() >= 19));
   map.on("moveend", () => meta.set("mapView", { center: map.getCenter(), zoom: map.getZoom() }));
+  map.on("click", (e) => onMapTap(e.latlng));
+  map.on("dragstart", () => (state.follow = false));
 
+  meta.get("mapMode").then((m) => setMode(m || (state.features.length ? "plan" : "satellite")));
   meta.get("mapView").then((v) => {
-    const located = state.plants.filter((p) => p.lat != null);
-    if (located.length) {
-      map.fitBounds(L.latLngBounds(located.map((p) => [p.lat, p.lng])).pad(0.3), { maxZoom: 20 });
+    const pts = [
+      ...state.plants.filter((p) => p.lat != null),
+      ...state.features.flatMap((f) => f.points),
+    ];
+    if (pts.length) {
+      map.fitBounds(L.latLngBounds(pts.map((p) => [p.lat, p.lng])).pad(0.2), { maxZoom: 21 });
     } else if (v) {
       map.setView(v.center, v.zoom);
     } else {
@@ -169,6 +210,18 @@ function initMap() {
       locateMe(false);
     }
   });
+}
+
+function setMode(mode) {
+  if (!state.map || !state.layers[mode === "plan" ? "grid" : mode]) mode = "satellite";
+  state.mode = mode;
+  const { satellite, street, grid } = state.layers;
+  for (const l of [satellite, street, grid]) l.remove();
+  (mode === "plan" ? grid : state.layers[mode]).addTo(state.map);
+  state.map.getContainer().classList.toggle("plan-mode", mode === "plan");
+  $$(".seg [data-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === mode)));
+  meta.set("mapMode", mode);
+  renderFeatures();
 }
 
 function pinIcon(p) {
@@ -201,10 +254,67 @@ function renderMarkers() {
     }
     m.unbindTooltip();
     m.bindTooltip(esc(displayName(p)), { permanent: true, direction: "top", offset: [14, -30], className: "plant-label" });
+
+    // Canopy circle: the plant's mature spread, drawn to scale on the plan.
+    const radius = Math.min(Math.max((p.ai?.mature_spread_m || 0.8) / 2, 0.15), 10);
+    let c = state.canopies.get(p.id);
+    if (!c) {
+      c = L.circle([p.lat, p.lng], { radius, color: "#2f6d3c", weight: 1, fillColor: "#5aa864", fillOpacity: 0.35, interactive: false }).addTo(state.map);
+      state.canopies.set(p.id, c);
+    } else c.setLatLng([p.lat, p.lng]).setRadius(radius);
   }
   for (const [id, m] of state.markers) {
-    if (!seen.has(id)) { m.remove(); state.markers.delete(id); }
+    if (!seen.has(id)) { m.remove(); state.markers.delete(id); state.canopies.get(id)?.remove(); state.canopies.delete(id); }
   }
+}
+
+/* ---------------- Garden plan features ---------------- */
+
+function renderFeatures() {
+  if (!state.map) return;
+  const sat = state.mode !== "plan";
+  const seen = new Set();
+  // Areas first (largest underneath), then lines on top.
+  const order = [...state.features].sort((a, b) => (a.closed === b.closed ? areaM2(b.points) - areaM2(a.points) : a.closed ? -1 : 1));
+  for (const f of order) {
+    if (f.points.length < 2) continue;
+    seen.add(f.id);
+    const latlngs = f.points.map((p) => [p.lat, p.lng]);
+    let layer = state.featureLayers.get(f.id);
+    if (layer && (layer instanceof L.Polygon) !== Boolean(f.closed && f.points.length > 2)) { layer.remove(); layer = null; }
+    if (!layer) {
+      layer = f.closed && f.points.length > 2 ? L.polygon(latlngs) : L.polyline(latlngs);
+      layer.on("click", (e) => { L.DomEvent.stopPropagation(e); if (!state.trace && !state.editing && !state.moving) openFeature(f.id); });
+      layer.addTo(state.map);
+      state.featureLayers.set(f.id, layer);
+    } else layer.setLatLngs(latlngs);
+    layer.setStyle(featureStyle(f, sat));
+    layer.bringToFront();
+    layer.unbindTooltip();
+    const label = f.name || (FEATURE_TYPES[f.type] || FEATURE_TYPES.other).label;
+    layer.bindTooltip(esc(label), { permanent: true, direction: "center", className: "feature-label" });
+  }
+  for (const [id, l] of state.featureLayers) if (!seen.has(id)) { l.remove(); state.featureLayers.delete(id); }
+  // Keep plant canopies above the beds they sit in.
+  for (const c of state.canopies.values()) c.bringToFront();
+}
+
+async function saveFeatures() {
+  await meta.set("features", state.features);
+  renderFeatures();
+}
+
+/** The smallest traced area a point sits inside, e.g. "Front border". */
+function featureAt(lat, lng) {
+  if (lat == null) return null;
+  const hits = state.features.filter((f) => f.closed && f.points.length > 2 && pointInPolygon({ lat, lng }, f.points));
+  hits.sort((a, b) => areaM2(a.points) - areaM2(b.points));
+  return hits[0] || null;
+}
+
+function featureLabel(f) {
+  const t = (FEATURE_TYPES[f.type] || FEATURE_TYPES.other).label;
+  return f.name ? `${f.name} (${t.toLowerCase()})` : t;
 }
 
 function showMe(lat, lng, acc) {
@@ -234,50 +344,344 @@ function locateMe(announce = true) {
   );
 }
 
-/* ---------------- Walk mode ---------------- */
+/* ---------------- Tracking: walks and tracing ---------------- */
+
+function ensureTracker() {
+  if (!state.tracker) state.tracker = new Tracker();
+  const t = state.tracker;
+  t.stepLength = Number(state.settings.stepLength) || 0.7;
+  t.useMotion = state.settings.useMotion !== false;
+  t.onUpdate = onTrackerUpdate;
+  t.onError = (err) => {
+    if (err.code === 1) {
+      toast("Location permission is off. Allow location for this site in your browser settings.");
+      if (state.walk.active) toggleWalk();
+      if (state.trace) cancelTrace();
+      return;
+    }
+    // Brief dropouts are normal under trees; only mention it now and then.
+    if (Date.now() - (state.lastGpsWarn || 0) > 30000) { state.lastGpsWarn = Date.now(); toast("Weak GPS signal. Steps and compass keep tracking for now."); }
+  };
+  return t;
+}
+
+/** Start the fused tracker. Call from a tap so iOS can ask for motion permission. */
+async function startTracking() {
+  if (!("geolocation" in navigator)) { toast("This device can't share its location."); return null; }
+  const t = ensureTracker();
+  if (!t.active) {
+    state.follow = true;
+    await t.start();
+    try { state.walk.wakeLock = await navigator.wakeLock?.request("screen"); } catch { /* optional */ }
+    if (!t.motion && t.useMotion) toast("Motion sensors unavailable, so tracking uses GPS only.");
+  }
+  return t;
+}
+
+function stopTrackingIfIdle() {
+  if (state.walk.active || state.trace?.source === "walk") return;
+  state.tracker?.stop();
+  state.walk.wakeLock?.release?.().catch(() => {});
+  state.walk.wakeLock = null;
+  gpsChip(null);
+}
+
+function onTrackerUpdate(p) {
+  showMe(p.lat, p.lng, p.accuracy);
+  gpsChip(p.accuracy, p.fused ? p.steps : 0);
+  if (state.follow && state.map && !state.editing) {
+    const want = state.trace ? 21 : 19;
+    if (state.map.getZoom() < want) state.map.setView([p.lat, p.lng], want + 1);
+    else state.map.panTo([p.lat, p.lng], { animate: true });
+  }
+  const w = state.walk;
+  if (w.active) {
+    const last = w.path[w.path.length - 1];
+    if (p.accuracy <= 15 && (!last || metres(last, p) >= 1)) {
+      w.path.push({ lat: p.lat, lng: p.lng, acc: p.accuracy, t: Date.now() });
+      w.line?.addLatLng([p.lat, p.lng]);
+      if (w.path.length % 10 === 0) meta.set("walkPath", w.path);
+    }
+  }
+  const tr = state.trace;
+  if (tr?.source === "walk" && !tr.paused) {
+    const last = tr.points[tr.points.length - 1];
+    if (!last || metres(last, p) >= 0.4) { tr.points.push({ lat: p.lat, lng: p.lng }); updateTrace(); }
+  }
+}
 
 async function toggleWalk() {
   const w = state.walk;
   const btn = $("#btn-walk");
   if (w.active) {
-    navigator.geolocation.clearWatch(w.watchId);
     w.active = false;
-    w.wakeLock?.release?.().catch(() => {});
-    w.wakeLock = null;
     btn.setAttribute("aria-pressed", "false");
     $(".label", btn).textContent = "Start walk";
     await meta.set("walkPath", w.path);
-    gpsChip(null);
+    stopTrackingIfIdle();
     toast("Walk saved");
     return;
   }
-  if (!("geolocation" in navigator)) return toast("This device can't share its location.");
   w.active = true;
   btn.setAttribute("aria-pressed", "true");
   $(".label", btn).textContent = "Stop walk";
-  try { w.wakeLock = await navigator.wakeLock?.request("screen"); } catch { /* optional */ }
-  let first = true;
-  w.watchId = navigator.geolocation.watchPosition(
-    (pos) => {
-      const pt = { lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy, t: Date.now() };
-      showMe(pt.lat, pt.lng, pt.acc);
-      gpsChip(pt.acc);
-      if (first) { state.map?.setView([pt.lat, pt.lng], Math.max(state.map.getZoom(), 19)); first = false; }
-      else state.map?.panTo([pt.lat, pt.lng], { animate: true });
-      const last = w.path[w.path.length - 1];
-      if (pt.acc <= 20 && (!last || metres(last, pt) >= 1.5)) {
-        w.path.push(pt);
-        w.line?.addLatLng([pt.lat, pt.lng]);
-        if (w.path.length % 10 === 0) meta.set("walkPath", w.path);
-      }
-    },
-    (err) => {
-      toast(err.code === 1 ? "Location permission is off for this site." : "Lost GPS signal.");
-      if (err.code === 1) toggleWalk();
-    },
-    { enableHighAccuracy: true, maximumAge: 0 }
-  );
-  toast("Walking. Tap Add plant here at each plant.");
+  if (!(await startTracking())) { w.active = false; btn.setAttribute("aria-pressed", "false"); $(".label", btn).textContent = "Start walk"; return; }
+  toast("Walking. Tap Add plant here at each plant, or Trace to map a bed or path.");
+}
+
+/* Swap the buttons along the bottom of the map for a mode's own controls. */
+function setActionBar(html) {
+  const bar = $(".map-actions");
+  if (state.savedActions == null) state.savedActions = bar.innerHTML;
+  bar.innerHTML = html;
+  bar.classList.add("mode");
+}
+function restoreActionBar() {
+  const bar = $(".map-actions");
+  if (state.savedActions != null) bar.innerHTML = state.savedActions;
+  state.savedActions = null;
+  bar.classList.remove("mode");
+  bindMapActions();
+}
+
+function openTraceStart() {
+  const types = Object.entries(FEATURE_TYPES);
+  openSheet(`
+    <div class="sheet-head">
+      <div><h2>Map part of the garden</h2><p class="muted">Pick what it is, then walk round its edge or tap its corners on the map.</p></div>
+      <button class="close" data-close aria-label="Close">×</button>
+    </div>
+    <div class="type-grid" role="radiogroup" aria-label="What are you mapping?">
+      ${types.map(([k, t], i) => `<button class="type-opt" role="radio" aria-checked="${i === 0}" data-type="${k}">
+        <span class="swatch" style="--sw:${t.fill || t.color};--sw-line:${t.color}" data-shape="${t.closed ? "area" : "line"}"></span>${esc(t.label)}</button>`).join("")}
+    </div>
+    <label class="field"><span>Name <span class="muted small">(optional)</span></span>
+      <input id="trace-name" placeholder="e.g. Back border, Veg bed 2, Gravel path">
+    </label>
+    <div class="callout small">
+      <p><strong>Walk round it:</strong> hold the phone flat in front of you, pointing the way you walk, and go at a steady pace along the edge. The app uses GPS plus your steps and compass, so shapes come out smoother than GPS alone.</p>
+      <p><strong>Tap on the map:</strong> quicker for straight-edged shapes, or when the GPS is poor.</p>
+    </div>
+    <div class="actions">
+      <button class="primary" data-start="walk">Walk round it</button>
+      <button class="secondary" data-start="tap">Tap on the map</button>
+    </div>
+  `);
+  let type = types[0][0];
+  $("#sheet-body").onclick = async (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.matches("[data-close]")) return closeSheet();
+    if (b.dataset.type) {
+      type = b.dataset.type;
+      $$(".type-opt").forEach((o) => o.setAttribute("aria-checked", String(o === b)));
+      return;
+    }
+    if (b.dataset.start) {
+      const name = $("#trace-name").value.trim();
+      closeSheet();
+      startTrace(type, name, b.dataset.start);
+    }
+  };
+}
+
+async function startTrace(type, name, source) {
+  switchView("map");
+  if (!state.map) return toast("The map needs to load before you can trace.");
+  const t = FEATURE_TYPES[type];
+  const tr = (state.trace = {
+    type, name, source, closed: t.closed, points: [],
+    layer: L.polyline([], { color: t.color, weight: 4, dashArray: "6 6", opacity: 0.95, interactive: false }).addTo(state.map),
+    dots: L.layerGroup().addTo(state.map),
+  });
+  setActionBar(`
+    <div class="trace-bar">
+      <div class="trace-info"><strong>${esc(name || t.label)}</strong><span id="trace-stats" class="mono small"></span></div>
+      <div class="trace-btns">
+        ${source === "walk" ? `<button class="secondary" id="trace-pause">Pause</button>` : ""}
+        <button class="secondary" id="trace-undo">Undo</button>
+        <button class="secondary" id="trace-cancel">Cancel</button>
+        <button class="primary" id="trace-done">Finish</button>
+      </div>
+    </div>`);
+  $("#trace-undo").onclick = () => { tr.points.pop(); updateTrace(); };
+  $("#trace-cancel").onclick = cancelTrace;
+  $("#trace-done").onclick = finishTrace;
+  if (source === "walk") {
+    $("#trace-pause").onclick = (e) => {
+      tr.paused = !tr.paused;
+      e.target.textContent = tr.paused ? "Resume" : "Pause";
+    };
+    const tk = await startTracking();
+    if (!tk) return cancelTrace();
+    if (tk.position) tr.points.push({ lat: tk.position.lat, lng: tk.position.lng });
+    toast("Walk along the edge. Tap Finish when you're back where you started.", 4000);
+  } else {
+    toast("Tap each corner on the map.", 3000);
+  }
+  updateTrace();
+}
+
+function onMapTap(latlng) {
+  const tr = state.trace;
+  if (tr?.source === "tap") {
+    tr.points.push({ lat: latlng.lat, lng: latlng.lng });
+    updateTrace();
+  }
+}
+
+function updateTrace() {
+  const tr = state.trace;
+  if (!tr) return;
+  const ll = tr.points.map((p) => [p.lat, p.lng]);
+  tr.layer.setLatLngs(tr.closed && ll.length > 2 ? [...ll, ll[0]] : ll);
+  if (tr.source === "tap") {
+    tr.dots.clearLayers();
+    for (const p of ll) L.circleMarker(p, { radius: 5, color: "#fff", weight: 2, fillColor: FEATURE_TYPES[tr.type].color, fillOpacity: 1, interactive: false }).addTo(tr.dots);
+  }
+  const stats = $("#trace-stats");
+  if (!stats) return;
+  const n = tr.points.length;
+  const size = tr.closed && n > 2 ? formatArea(areaM2(tr.points)) : formatLength(lengthM(tr.points));
+  stats.textContent = n ? `${n} point${n === 1 ? "" : "s"} · ${size}` : tr.source === "walk" ? "Waiting for GPS…" : "Tap the first corner";
+}
+
+function endTrace() {
+  const tr = state.trace;
+  if (!tr) return;
+  tr.layer.remove();
+  tr.dots.remove();
+  state.trace = null;
+  restoreActionBar();
+  stopTrackingIfIdle();
+}
+
+function cancelTrace() {
+  endTrace();
+  toast("Tracing cancelled");
+}
+
+async function finishTrace() {
+  const tr = state.trace;
+  const need = tr.closed ? 3 : 2;
+  let pts = tr.points;
+  if (tr.source === "walk") {
+    const gap = pts.length > 3 ? metres(pts[0], pts[pts.length - 1]) : Infinity;
+    if (tr.closed && state.tracker?.deadReckoning && gap < 0.3 * lengthM(pts)) {
+      // Back at the start: the leftover gap is step/compass drift, so spread it out along the walk.
+      pts = closeLoop(pts);
+    } else if (tr.closed && gap < 1.5) {
+      pts = pts.slice(0, -1); // near-duplicate of the first point
+    }
+    pts = simplify(pts, 0.3);
+  }
+  if (pts.length < need) return toast(tr.closed ? "Need at least 3 points for an area. Keep going." : "Need at least 2 points.");
+  const f = { id: uid(), type: tr.type, name: tr.name, closed: tr.closed, points: pts, createdAt: Date.now(), source: tr.source };
+  state.features.push(f);
+  endTrace();
+  if (state.mode !== "plan") setMode("plan");
+  await saveFeatures();
+  toast(`Saved · ${f.closed ? formatArea(areaM2(f.points)) : formatLength(lengthM(f.points))}`);
+}
+
+/* ---------------- Feature details & shape editing ---------------- */
+
+function openFeature(id) {
+  const f = state.features.find((x) => x.id === id);
+  if (!f) return;
+  const t = FEATURE_TYPES[f.type] || FEATURE_TYPES.other;
+  const inside = f.closed ? state.plants.filter((p) => p.lat != null && featureAt(p.lat, p.lng)?.id === f.id) : [];
+  const size = f.closed
+    ? `${formatArea(areaM2(f.points))} · ${formatLength(lengthM(f.points, true))} round the edge`
+    : `${formatLength(lengthM(f.points))} long`;
+  openSheet(`
+    <div class="sheet-head">
+      <div><h2>${esc(f.name || t.label)}</h2><p class="mono muted">${size}</p></div>
+      <button class="close" data-close aria-label="Close">×</button>
+    </div>
+    <label class="field"><span>Name</span><input id="f-name" value="${esc(f.name)}" placeholder="${esc(t.label)}"></label>
+    <label class="field"><span>Type</span>
+      <select id="f-type">${Object.entries(FEATURE_TYPES).map(([k, v]) => `<option value="${k}" ${k === f.type ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select>
+    </label>
+    <label class="check"><input type="checkbox" id="f-closed" ${f.closed ? "checked" : ""}> Join up the ends (an area, not a line)</label>
+    ${f.closed ? `<div><p class="section-label">Plants here</p>${inside.length
+      ? `<div class="chips">${inside.map((p) => `<button class="chip-btn" data-plant="${p.id}">${esc(displayName(p))}</button>`).join("")}</div>`
+      : `<p class="muted">No plants recorded inside this area yet.</p>`}</div>` : ""}
+    <div class="actions">
+      <button class="secondary" data-act="edit">Adjust shape</button>
+      <button class="ghost danger-text" data-act="delete">Delete</button>
+    </div>
+  `);
+  const save = async () => {
+    f.name = $("#f-name").value.trim();
+    f.type = $("#f-type").value;
+    f.closed = $("#f-closed").checked;
+    await saveFeatures();
+    renderAll();
+  };
+  $("#f-name").onchange = save;
+  $("#f-type").onchange = save;
+  $("#f-closed").onchange = async () => { await save(); openFeature(f.id); };
+  $("#sheet-body").onclick = async (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.matches("[data-close]")) return closeSheet();
+    if (b.dataset.plant) return openPlant(b.dataset.plant);
+    if (b.dataset.act === "edit") { closeSheet(); return editShape(f.id); }
+    if (b.dataset.act === "delete") {
+      b.parentElement.innerHTML = `<p style="flex-basis:100%">Delete ${esc(f.name || t.label.toLowerCase())} from the plan?</p>
+        <button class="secondary" data-act="keep">Keep it</button><button class="primary" style="background:var(--bad)" data-act="really">Delete</button>`;
+      return;
+    }
+    if (b.dataset.act === "keep") return openFeature(f.id);
+    if (b.dataset.act === "really") {
+      state.features = state.features.filter((x) => x.id !== f.id);
+      await saveFeatures();
+      closeSheet();
+      toast("Removed from the plan");
+    }
+  };
+}
+
+function editShape(id) {
+  const f = state.features.find((x) => x.id === id);
+  const layer = state.featureLayers.get(id);
+  if (!f || !layer) return;
+  switchView("map");
+  state.follow = false;
+  state.map.fitBounds(layer.getBounds().pad(0.3), { maxZoom: 23 });
+  const group = L.layerGroup().addTo(state.map);
+  const icon = L.divIcon({ className: "", html: '<div class="vertex"></div>', iconSize: [22, 22], iconAnchor: [11, 11] });
+  const original = f.points.map((p) => ({ ...p }));
+  const draw = () => {
+    group.clearLayers();
+    f.points.forEach((p, i) => {
+      const m = L.marker([p.lat, p.lng], { icon, draggable: true, zIndexOffset: 2000 }).addTo(group);
+      m.on("drag", (e) => { const ll = e.target.getLatLng(); f.points[i] = { lat: ll.lat, lng: ll.lng }; layer.setLatLngs(f.points.map((q) => [q.lat, q.lng])); });
+      m.on("click", () => {
+        // Tap a corner twice within a second to remove it.
+        if (m._armed && f.points.length > (f.closed ? 3 : 2)) { f.points.splice(i, 1); layer.setLatLngs(f.points.map((q) => [q.lat, q.lng])); draw(); return; }
+        m._armed = true; setTimeout(() => (m._armed = false), 1000);
+      });
+    });
+  };
+  draw();
+  state.editing = { id, group };
+  setActionBar(`
+    <div class="trace-bar">
+      <div class="trace-info"><strong>Adjust shape</strong><span class="small muted">Drag corners. Double-tap one to remove it.</span></div>
+      <div class="trace-btns"><button class="secondary" id="edit-cancel">Cancel</button><button class="primary" id="edit-done">Done</button></div>
+    </div>`);
+  const end = async (keep) => {
+    if (!keep) f.points = original;
+    group.remove();
+    state.editing = null;
+    restoreActionBar();
+    await saveFeatures();
+    renderAll();
+  };
+  $("#edit-done").onclick = () => end(true);
+  $("#edit-cancel").onclick = () => end(false);
 }
 
 /* ---------------- Sheet ---------------- */
@@ -349,7 +753,7 @@ function openAddPlant() {
   };
   renderPhotos();
 
-  const sampler = sampleFix({
+  const sampler = getFix({
     onProgress: (fix, raw) => {
       draft.fix = fix;
       const quality = Math.max(0, Math.min(1, (25 - fix.accuracy) / 22));
@@ -357,15 +761,17 @@ function openAddPlant() {
       if (!ring) return;
       ring.style.strokeDashoffset = String(C * (1 - quality));
       $("#fix-acc").textContent = `±${fix.accuracy.toFixed(1)} m`;
-      $("#fix-sub").textContent = `${fix.samples} reading${fix.samples === 1 ? "" : "s"} · latest ±${Math.round(raw.accuracy)} m`;
-      gpsChip(raw.accuracy);
+      $("#fix-sub").textContent = fix.fromWalk
+        ? `${fix.fused ? "GPS + steps + compass" : "Averaging GPS from your walk"} · GPS alone ±${Math.round(raw.accuracy)} m`
+        : `${fix.samples} reading${fix.samples === 1 ? "" : "s"} · latest ±${Math.round(raw.accuracy)} m`;
+      gpsChip(fix.fused ? fix.accuracy : raw.accuracy, fix.fused ? fix.steps : 0);
       showMe(fix.lat, fix.lng, fix.accuracy);
     },
   });
   sampler.promise.then(
     (fix) => {
       draft.fix = fix;
-      if ($("#fix-sub")) $("#fix-sub").textContent = `Locked from ${fix.samples} readings`;
+      if ($("#fix-sub")) $("#fix-sub").textContent = fix.fromWalk ? "Locked from your walk" : `Locked from ${fix.samples} readings`;
     },
     (err) => {
       draft.fixError = err.message;
@@ -423,6 +829,22 @@ function openAddPlant() {
 
 /* ---------------- Identification ---------------- */
 
+/** Where the plant sits on the plan, in words, so the care plan can account for it. */
+function describeSurroundings(p) {
+  if (p.lat == null) return "";
+  const parts = [];
+  const inside = featureAt(p.lat, p.lng);
+  if (inside) parts.push(`Growing in: ${featureLabel(inside)}.`);
+  const near = [];
+  for (const f of state.features) {
+    if (f === inside || !["building", "hedge", "boundary", "water", "patio"].includes(f.type)) continue;
+    const d = Math.min(...f.points.map((q) => metres(p, q)));
+    if (d <= 3) near.push(`${featureLabel(f)} about ${Math.max(1, Math.round(d))} m away`);
+  }
+  if (near.length) parts.push(`Nearby: ${near.join("; ")}.`);
+  return parts.join(" ");
+}
+
 async function runIdentify(plantId) {
   const p = state.plants.find((x) => x.id === plantId);
   if (!p) return;
@@ -440,6 +862,7 @@ async function runIdentify(plantId) {
     const result = await identifyPlant({
       apiKey: state.settings.apiKey, model: state.settings.model, images,
       lat: p.lat, lng: p.lng, notes: p.notes, settings: state.settings,
+      where: describeSurroundings(p),
     });
     p.ai = result;
   } catch (err) {
@@ -571,6 +994,7 @@ async function renderPlantSheet(p) {
 
     <div>
       <p class="section-label">Position</p>
+      ${featureAt(p.lat, p.lng) ? `<p>In <strong>${esc(featureLabel(featureAt(p.lat, p.lng)))}</strong></p>` : ""}
       <p class="coords">${posText}</p>
     </div>
     <div class="actions">
@@ -626,7 +1050,7 @@ async function renderPlantSheet(p) {
         t.disabled = true;
         t.textContent = "Locating…";
         try {
-          const fix = await sampleFix({ onProgress: (f) => (t.textContent = `±${f.accuracy.toFixed(1)} m…`) }).promise;
+          const fix = await getFix({ onProgress: (f) => (t.textContent = `±${f.accuracy.toFixed(1)} m…`) }).promise;
           Object.assign(p, { lat: fix.lat, lng: fix.lng, accuracy: fix.accuracy, approx: false });
           await savePlant(p);
           toast(`Position updated (±${Math.round(fix.accuracy)} m)`);
@@ -661,16 +1085,14 @@ function startMovePin(id) {
   state.moving = id;
   state.map.setView(m.getLatLng(), Math.max(state.map.getZoom(), 20));
   m.dragging.enable();
-  const actions = $(".map-actions");
-  const saved = actions.innerHTML;
-  actions.innerHTML = `<span class="pill">Drag the pin to the plant</span><button class="fab" id="move-done">Done</button>`;
+  state.follow = false;
+  setActionBar(`<span class="pill">Drag the pin to the plant</span><button class="fab" id="move-done">Done</button>`);
   $("#move-done").onclick = async () => {
     m.dragging.disable();
     const ll = m.getLatLng();
     Object.assign(p, { lat: ll.lat, lng: ll.lng, approx: true, accuracy: null });
     state.moving = null;
-    actions.innerHTML = saved;
-    bindMapActions();
+    restoreActionBar();
     await savePlant(p);
     toast("Pin moved");
   };
@@ -758,6 +1180,8 @@ function fillSettings() {
   $("#set-key").value = state.settings.apiKey || "";
   $("#set-model").value = state.settings.model || DEFAULT_MODEL;
   $("#set-climate").value = state.settings.climate || "";
+  $("#set-step").value = state.settings.stepLength || 0.7;
+  $("#set-motion").checked = state.settings.useMotion !== false;
 }
 
 async function exportBackup() {
@@ -767,6 +1191,7 @@ async function exportBackup() {
     plants: state.plants,
     photos: await Promise.all(ph.map(async (x) => ({ id: x.id, plantId: x.plantId, createdAt: x.createdAt, data: await blobToBase64(x.blob) }))),
     walkPath: state.walk.path,
+    features: state.features,
     jobsDone: state.jobsDone,
   };
   const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
@@ -792,9 +1217,14 @@ async function importBackup(file) {
       await photoStore.put({ id: x.id, plantId: x.plantId, createdAt: x.createdAt, blob: new Blob([bin], { type: "image/jpeg" }) });
     }
     if (data.walkPath?.length) await meta.set("walkPath", data.walkPath);
+    if (data.features?.length) {
+      const have = new Set(state.features.map((f) => f.id));
+      await meta.set("features", [...state.features, ...data.features.filter((f) => !have.has(f.id))]);
+    }
     if (data.jobsDone) await meta.set("jobsDone", { ...state.jobsDone, ...data.jobsDone });
     await loadAll();
     state.walk.line?.setLatLngs(state.walk.path.map((p) => [p.lat, p.lng]));
+    renderFeatures();
     renderAll();
     toast(`Imported ${data.plants?.length || 0} plants`);
   } catch {
@@ -805,6 +1235,7 @@ async function importBackup(file) {
 function bindMapActions() {
   $("#btn-add").onclick = openAddPlant;
   $("#btn-walk").onclick = toggleWalk;
+  $("#btn-trace").onclick = openTraceStart;
   if (state.walk.active) {
     $("#btn-walk").setAttribute("aria-pressed", "true");
     $("#btn-walk .label").textContent = "Stop walk";
@@ -814,13 +1245,12 @@ function bindMapActions() {
 function bindUI() {
   $$(".tab").forEach((t) => (t.onclick = () => switchView(t.dataset.view)));
   bindMapActions();
-  $("#btn-locate").onclick = () => locateMe(true);
-  $("#btn-layer").onclick = () => {
-    if (!state.map) return;
-    state.layers[state.layerIdx].remove();
-    state.layerIdx = (state.layerIdx + 1) % state.layers.length;
-    state.layers[state.layerIdx].addTo(state.map);
+  $("#btn-locate").onclick = () => {
+    const p = state.tracker?.active && state.tracker.position;
+    if (p) { state.follow = true; state.map?.setView([p.lat, p.lng], Math.max(state.map.getZoom(), 20)); }
+    else locateMe(true);
   };
+  $$(".seg [data-mode]").forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
   $("#sheet-backdrop").onclick = closeSheet;
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#sheet").hidden) closeSheet(); });
 
@@ -840,7 +1270,11 @@ function bindUI() {
 
   $("#settings-form").onsubmit = async (e) => {
     e.preventDefault();
-    state.settings = { apiKey: $("#set-key").value.trim(), model: $("#set-model").value, climate: $("#set-climate").value.trim() };
+    const step = parseFloat($("#set-step").value);
+    state.settings = {
+      apiKey: $("#set-key").value.trim(), model: $("#set-model").value, climate: $("#set-climate").value.trim(),
+      stepLength: step >= 0.3 && step <= 1.5 ? step : 0.7, useMotion: $("#set-motion").checked,
+    };
     await meta.set("settings", state.settings);
     toast("Settings saved");
   };

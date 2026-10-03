@@ -20,6 +20,8 @@ const SCHEMA = obj({
   scientific_name: str,
   family: str,
   plant_type: str,
+  mature_height_m: { type: "number" },
+  mature_spread_m: { type: "number" },
   confidence: { type: "string", enum: ["high", "medium", "low"] },
   alternatives: { type: "array", items: obj({ common_name: str, scientific_name: str, reason: str }) },
   description: str,
@@ -58,6 +60,7 @@ Then write a practical care plan for this plant in this garden:
 - Be specific and actionable: quantities, frequencies, which month, what to look for. Plain language, no fluff.
 - "calendar" must contain all 12 months (1-12) in order; a month may have an empty task list if nothing is needed.
 - Assess health only from what is visible in the photos; say "unknown" if you can't tell.
+- "mature_height_m" / "mature_spread_m": typical size when fully grown, in metres (used to draw it to scale on a garden plan).
 - "toxicity" covers pets (cats, dogs) and children.
 - "tips": 2-4 short, high-value tips specific to this plant.`;
 
@@ -65,13 +68,14 @@ function client(apiKey) {
   return new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
 }
 
-function contextText({ lat, lng, notes, settings }) {
+function contextText({ lat, lng, notes, settings, where }) {
   const now = new Date();
   const lines = [`Date: ${now.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })} (month ${now.getMonth() + 1}).`];
   if (lat != null) {
     lines.push(`Approximate location: ${lat.toFixed(1)}, ${lng.toFixed(1)} (${lat >= 0 ? "northern" : "southern"} hemisphere).`);
   }
   if (settings?.climate) lines.push(`Gardener's notes on their garden/climate: ${settings.climate}`);
+  if (where) lines.push(`Position in the garden: ${where}`);
   if (notes) lines.push(`Gardener's notes on this plant: ${notes}`);
   return lines.join("\n");
 }
@@ -82,14 +86,14 @@ function contextText({ lat, lng, notes, settings }) {
  * @param {string} [o.model]
  * @param {{mediaType:string,data:string}[]} o.images base64 JPEGs
  */
-export async function identifyPlant({ apiKey, model, images, lat, lng, notes, settings }) {
+export async function identifyPlant({ apiKey, model, images, lat, lng, notes, settings, where }) {
   if (!apiKey) throw new Error("Add your Claude API key in Settings to identify plants.");
   const content = [
     ...images.slice(0, 5).map((img) => ({
       type: "image",
       source: { type: "base64", media_type: img.mediaType, data: img.data },
     })),
-    { type: "text", text: contextText({ lat, lng, notes, settings }) + "\n\nIdentify this plant and write its care plan." },
+    { type: "text", text: contextText({ lat, lng, notes, settings, where }) + "\n\nIdentify this plant and write its care plan." },
   ];
 
   let response;

@@ -1,9 +1,9 @@
 // Offline support: app shell + libraries cached on first visit; map tiles cached as you view them.
-const SHELL = "garden-shell-v1";
+const SHELL = "garden-shell-v2";
 const RUNTIME = "garden-runtime-v1";
 const TILES = "garden-tiles-v1";
 const SHELL_FILES = ["./", "index.html", "styles.css", "app.js", "db.js", "ai.js", "manifest.webmanifest", "icon.svg",
-  "vendor/anthropic-sdk.mjs", "vendor/leaflet/leaflet.js", "vendor/leaflet/leaflet.css"];
+  "tracker.js", "geo.js", "plan.js", "vendor/anthropic-sdk.mjs", "vendor/leaflet/leaflet.js", "vendor/leaflet/leaflet.css"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(SHELL).then((c) => c.addAll(SHELL_FILES)).then(() => self.skipWaiting()));
