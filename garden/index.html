@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1f3a2c">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Garden Log</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="styles.css">
+  <script src="vendor/leaflet/leaflet.js" defer></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1 class="brand">Garden Log</h1>
+    <span id="gps-chip" class="chip" hidden></span>
+  </header>
+
+  <main>
+    <!-- MAP -->
+    <section id="view-map" class="view">
+      <div id="map" aria-label="Garden map"></div>
+      <div id="map-fallback" class="map-fallback" hidden>
+        <p>The map needs a connection to load. Your plants are still saved. Open the <strong>Plants</strong> tab to see them.</p>
+      </div>
+      <div class="map-controls">
+        <button id="btn-locate" class="round" title="Centre on me" aria-label="Centre on me">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /><circle cx="12" cy="12" r="7.5" fill="none"/></svg>
+        </button>
+        <button id="btn-layer" class="round" title="Switch map style" aria-label="Switch map style">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 8l10 5 10-5-10-5Z" fill="none"/><path d="m2 13 10 5 10-5M2 17.5 12 22l10-4.5" fill="none"/></svg>
+        </button>
+      </div>
+      <div class="map-actions">
+        <button id="btn-walk" class="pill" aria-pressed="false">
+          <span class="dot"></span><span class="label">Start walk</span>
+        </button>
+        <button id="btn-add" class="fab">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          Add plant here
+        </button>
+      </div>
+    </section>
+
+    <!-- PLANTS -->
+    <section id="view-plants" class="view" hidden>
+      <div class="page">
+        <div class="page-head">
+          <h2>Plants <span id="plant-count" class="count"></span></h2>
+          <input id="search" type="search" placeholder="Search by name" aria-label="Search plants">
+        </div>
+        <ul id="plant-list" class="plant-list"></ul>
+        <div id="plants-empty" class="empty" hidden>
+          <h3>No plants yet</h3>
+          <p>Go to the <strong>Map</strong>, stand next to a plant and tap <strong>Add plant here</strong>. Your position is saved and Claude identifies the plant from your photo.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- JOBS -->
+    <section id="view-jobs" class="view" hidden>
+      <div class="page">
+        <div class="page-head">
+          <h2 id="jobs-title">Jobs this month</h2>
+          <div class="month-nav">
+            <button id="month-prev" class="ghost" aria-label="Previous month">‹</button>
+            <button id="month-next" class="ghost" aria-label="Next month">›</button>
+          </div>
+        </div>
+        <div id="jobs" class="jobs"></div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="view-settings" class="view" hidden>
+      <div class="page narrow">
+        <h2>Settings</h2>
+        <form id="settings-form" class="stack">
+          <label class="field">
+            <span>Claude API key</span>
+            <input id="set-key" type="password" autocomplete="off" placeholder="sk-ant-…">
+            <small>Used to identify plants. Get one at console.anthropic.com. It is stored only on this phone and sent only to Anthropic.</small>
+          </label>
+          <label class="field">
+            <span>Model</span>
+            <select id="set-model">
+              <option value="claude-opus-5-5">Claude Opus 5.5 (most accurate)</option>
+              <option value="claude-sonnet-5-5">Claude Sonnet 5.5 (cheaper, faster)</option>
+              <option value="claude-haiku-4-5">Claude Haiku 4.5 (cheapest)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>About your garden</span>
+            <textarea id="set-climate" rows="3" placeholder="e.g. South-facing, clay soil, coastal and windy, frost most winters"></textarea>
+            <small>Helps Claude tailor care plans. Your approximate location (to about 10 km) is also sent.</small>
+          </label>
+          <button class="primary" type="submit">Save settings</button>
+        </form>
+
+        <h3>Your data</h3>
+        <p class="muted">Plants and photos are stored on this phone only. Export a backup now and then, or to move to a new phone.</p>
+        <div class="row wrap">
+          <button id="btn-export" class="secondary">Export backup</button>
+          <label class="secondary file-btn">Import backup<input id="import-file" type="file" accept="application/json,.json" hidden></label>
+          <button id="btn-clear-walk" class="secondary">Clear walk path</button>
+        </div>
+        <div id="danger" class="danger">
+          <button id="btn-wipe" class="ghost danger-text">Delete everything…</button>
+        </div>
+        <p id="storage-info" class="muted small mono"></p>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabbar" aria-label="Sections">
+    <button data-view="map" class="tab active">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2Z" fill="none"/><path d="M9 4v14M15 6v14"/></svg>Map
+    </button>
+    <button data-view="plants" class="tab">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21v-8M12 13c0-4 3-7 8-7 0 5-3 7-8 7ZM12 15c0-3-2.5-5.5-7-5.5 0 4 2.5 5.5 7 5.5Z" fill="none"/></svg>Plants
+    </button>
+    <button data-view="jobs" class="tab">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="2" fill="none"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>Jobs
+    </button>
+    <button data-view="settings" class="tab">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg>Settings
+    </button>
+  </nav>
+
+  <!-- Bottom sheet used for add-plant and plant details -->
+  <div id="sheet-backdrop" class="backdrop" hidden></div>
+  <section id="sheet" class="sheet" role="dialog" aria-modal="true" hidden>
+    <div class="grab" aria-hidden="true"></div>
+    <div id="sheet-body"></div>
+  </section>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <input id="photo-input" type="file" accept="image/*" capture="environment" hidden>
+  <input id="photo-input-gallery" type="file" accept="image/*" multiple hidden>
+</body>
+</html>
